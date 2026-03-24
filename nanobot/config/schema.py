@@ -30,6 +30,7 @@ class ChannelsConfig(Base):
 class AgentDefaults(Base):
     """Default agent configuration."""
 
+    engine: Literal["legacy", "sdk"] = "legacy"  # "sdk" uses Claude Agent SDK, "legacy" uses built-in loop
     workspace: str = "~/.nanobot/workspace"
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
