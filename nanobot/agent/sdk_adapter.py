@@ -1,7 +1,8 @@
 """SDK adapter: thin dispatcher wrapping the Claude Agent SDK.
 
 When config.agents.defaults.engine == "sdk", this module replaces the
-legacy AgentLoop with the Claude Agent SDK's query() / ClaudeSDKClient.
+legacy AgentLoop with ClaudeSDKClient — one persistent client per session
+(keyed by channel:chat_id).
 """
 
 from __future__ import annotations
@@ -9,20 +10,24 @@ from __future__ import annotations
 import asyncio
 import os
 from contextlib import nullcontext
-from pathlib import Path
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
+from nanobot import __version__
 from nanobot.agent.context import ContextBuilder
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 
 if TYPE_CHECKING:
-    from nanobot.config.schema import ChannelsConfig, Config, ExecToolConfig, MCPServerConfig
+    from nanobot.config.schema import ChannelsConfig, Config
     from nanobot.cron.service import CronService
 
+
+# ---------------------------------------------------------------------------
+# SDK availability check
+# ---------------------------------------------------------------------------
 
 def _check_sdk_available() -> None:
     """Raise a clear error if claude-agent-sdk is not installed."""
@@ -34,9 +39,13 @@ def _check_sdk_available() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# In-process MCP server for nanobot-specific tools (message, cron)
+# ---------------------------------------------------------------------------
+
 def _build_nanobot_mcp_server(
     bus: MessageBus,
-    cron_service: CronService | None,
+    cron_service: "CronService | None",
 ) -> Any:
     """Build an in-process MCP server with nanobot-specific tools."""
     from claude_agent_sdk import create_sdk_mcp_server, tool
@@ -256,6 +265,10 @@ def _build_nanobot_mcp_server(
     return server
 
 
+# ---------------------------------------------------------------------------
+# MCP server merging (in-process + external config-defined servers)
+# ---------------------------------------------------------------------------
+
 def _build_mcp_servers_dict(
     nanobot_server: Any,
     config_mcp_servers: dict[str, Any] | None,
@@ -266,7 +279,6 @@ def _build_mcp_servers_dict(
         return servers
 
     for name, mcp_cfg in config_mcp_servers.items():
-        # Convert nanobot MCPServerConfig to SDK dict format
         entry: dict[str, Any] = {}
         if hasattr(mcp_cfg, "command") and mcp_cfg.command:
             entry["command"] = mcp_cfg.command
@@ -284,11 +296,28 @@ def _build_mcp_servers_dict(
     return servers
 
 
+# ---------------------------------------------------------------------------
+# Per-session client wrapper
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _SessionClient:
+    """Wraps a persistent ClaudeSDKClient for one conversation session."""
+
+    client: Any  # ClaudeSDKClient
+    session_id: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# SDK Agent Loop
+# ---------------------------------------------------------------------------
+
 class SDKAgentLoop:
-    """Agent loop backed by the Claude Agent SDK.
+    """Agent loop backed by the Claude Agent SDK (ClaudeSDKClient).
 
     Drop-in replacement for AgentLoop when engine="sdk".
-    Shares the same public interface: run(), stop(), process_direct(), close_mcp().
+    Maintains one persistent ClaudeSDKClient per session key (channel:chat_id).
+    Public interface: run(), stop(), process_direct(), close_mcp().
     """
 
     def __init__(
@@ -311,7 +340,7 @@ class SDKAgentLoop:
         self._running = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
-        self._session_ids: dict[str, str] = {}  # session_key → SDK session_id
+        self._clients: dict[str, _SessionClient] = {}  # session_key → client
 
         _max = int(os.environ.get("NANOBOT_MAX_CONCURRENT_REQUESTS", "3"))
         self._concurrency_gate: asyncio.Semaphore | None = (
@@ -327,15 +356,11 @@ class SDKAgentLoop:
             config.tools.mcp_servers if config.tools.mcp_servers else None,
         )
 
-        # Command router (for /stop, /new, etc.)
-        self.commands = CommandRouter()
-        register_builtin_commands(self.commands)
+    # ------------------------------------------------------------------
+    # Options builder
+    # ------------------------------------------------------------------
 
-    def _build_options(
-        self,
-        *,
-        resume_session_id: str | None = None,
-    ) -> Any:
+    def _build_options(self) -> Any:
         """Build ClaudeAgentOptions from nanobot config."""
         from claude_agent_sdk import ClaudeAgentOptions
 
@@ -347,7 +372,6 @@ class SDKAgentLoop:
             "WebSearch", "WebFetch",
             "mcp__nanobot__*",
         ]
-        # Allow all configured external MCP servers
         for name in self._mcp_servers:
             if name != "nanobot":
                 allowed_tools.append(f"mcp__{name}__*")
@@ -364,9 +388,6 @@ class SDKAgentLoop:
             "cwd": str(self.workspace),
         }
 
-        if resume_session_id:
-            options_kwargs["resume"] = resume_session_id
-
         if defaults.reasoning_effort:
             options_kwargs["thinking"] = {
                 "type": "enabled",
@@ -374,6 +395,121 @@ class SDKAgentLoop:
             }
 
         return ClaudeAgentOptions(**options_kwargs)
+
+    # ------------------------------------------------------------------
+    # Per-session client lifecycle
+    # ------------------------------------------------------------------
+
+    async def _get_or_create_client(self, session_key: str) -> _SessionClient:
+        """Return an existing client for *session_key*, or create a new one."""
+        if session_key in self._clients:
+            return self._clients[session_key]
+
+        from claude_agent_sdk import ClaudeSDKClient
+
+        options = self._build_options()
+        client = ClaudeSDKClient(options=options)
+        await client.__aenter__()
+
+        sc = _SessionClient(client=client)
+        self._clients[session_key] = sc
+        logger.info("Created SDK client for session {}", session_key)
+        return sc
+
+    async def _close_client(self, session_key: str) -> None:
+        """Close and remove the client for *session_key*."""
+        sc = self._clients.pop(session_key, None)
+        if sc and sc.client:
+            try:
+                await sc.client.__aexit__(None, None, None)
+            except Exception:
+                logger.debug("Error closing SDK client for {}", session_key)
+        self._session_locks.pop(session_key, None)
+
+    # ------------------------------------------------------------------
+    # Slash command handling (SDK-aware replacements for legacy builtins)
+    # ------------------------------------------------------------------
+
+    async def _handle_slash_command(self, msg: InboundMessage) -> bool:
+        """Handle slash commands that need SDK-specific logic.
+
+        Returns True if the command was handled, False otherwise.
+        """
+        raw = msg.content.strip()
+
+        if raw == "/new":
+            await self._close_client(msg.session_key)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="New session started.",
+            ))
+            return True
+
+        if raw == "/stop":
+            sc = self._clients.get(msg.session_key)
+            if sc and sc.client:
+                try:
+                    await sc.client.interrupt()
+                except Exception:
+                    pass
+            tasks = self._active_tasks.pop(msg.session_key, [])
+            cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
+            for t in tasks:
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
+            content = f"Stopped {cancelled} task(s)." if cancelled else "No active task to stop."
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=content,
+            ))
+            return True
+
+        if raw == "/status":
+            n_sessions = len(self._clients)
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    f"nanobot v{__version__} | engine: sdk | model: {self.model} "
+                    f"| sessions: {n_sessions}"
+                ),
+                metadata={"render_as": "text"},
+            ))
+            return True
+
+        if raw == "/help":
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    "nanobot commands:\n"
+                    "/new \u2014 Start a new conversation\n"
+                    "/stop \u2014 Stop the current task\n"
+                    "/restart \u2014 Restart the bot\n"
+                    "/status \u2014 Show bot status\n"
+                    "/help \u2014 Show available commands"
+                ),
+                metadata={"render_as": "text"},
+            ))
+            return True
+
+        if raw == "/restart":
+            import sys
+
+            async def _do_restart() -> None:
+                await asyncio.sleep(1)
+                os.execv(sys.executable, [sys.executable, "-m", "nanobot"] + sys.argv[1:])
+
+            asyncio.create_task(_do_restart())
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="Restarting...",
+            ))
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     async def run(self) -> None:
         """Run the agent loop, consuming messages from the bus."""
@@ -393,13 +529,12 @@ class SDKAgentLoop:
                 logger.warning("Error consuming inbound message: {}, continuing...", e)
                 continue
 
+            # Handle slash commands (SDK-aware implementations)
             raw = msg.content.strip()
-            if self.commands.is_priority(raw):
-                ctx = CommandContext(msg=msg, session=None, key=msg.session_key, raw=raw, loop=self)
-                result = await self.commands.dispatch_priority(ctx)
-                if result:
-                    await self.bus.publish_outbound(result)
-                continue
+            if raw.startswith("/"):
+                handled = await self._handle_slash_command(msg)
+                if handled:
+                    continue
 
             task = asyncio.create_task(self._dispatch(msg))
             self._active_tasks.setdefault(msg.session_key, []).append(task)
@@ -410,6 +545,10 @@ class SDKAgentLoop:
                     else None
                 )
             )
+
+    # ------------------------------------------------------------------
+    # Per-message dispatch (serialized per session)
+    # ------------------------------------------------------------------
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message with per-session serialization."""
@@ -467,6 +606,10 @@ class SDKAgentLoop:
                     )
                 )
 
+    # ------------------------------------------------------------------
+    # Core SDK interaction
+    # ------------------------------------------------------------------
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -475,8 +618,8 @@ class SDKAgentLoop:
         on_stream: Callable[[str], Awaitable[None]] | None = None,
         on_stream_end: Callable[..., Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
-        """Process a single inbound message via the Claude Agent SDK."""
-        from claude_agent_sdk import query
+        """Process a single inbound message via ClaudeSDKClient."""
+        from claude_agent_sdk import AssistantMessage, ResultMessage, SystemMessage, TextBlock
 
         key = session_key or msg.session_key
 
@@ -485,30 +628,29 @@ class SDKAgentLoop:
             msg.channel, msg.chat_id, msg.metadata.get("message_id")
         )
 
-        # Resume existing session if available
-        resume_id = self._session_ids.get(key)
-        options = self._build_options(resume_session_id=resume_id)
+        # Get or create persistent client for this session
+        sc = await self._get_or_create_client(key)
 
         final_content = ""
-        session_id = None
 
         try:
-            async for message in query(prompt=msg.content, options=options):
-                msg_type = type(message).__name__
+            # Send prompt to the persistent client
+            await sc.client.query(msg.content)
 
-                if msg_type == "AssistantMessage":
-                    # Stream text content if streaming is enabled
+            # Stream response
+            async for message in sc.client.receive_response():
+                if isinstance(message, SystemMessage) and message.subtype == "init":
+                    sc.session_id = message.data.get("session_id")
+
+                elif isinstance(message, AssistantMessage):
                     if on_stream and hasattr(message, "content"):
                         for block in message.content:
-                            if hasattr(block, "text") and block.text:
+                            if isinstance(block, TextBlock) and block.text:
                                 await on_stream(block.text)
 
-                elif msg_type == "ResultMessage":
-                    if hasattr(message, "result") and message.result:
+                elif isinstance(message, ResultMessage):
+                    if message.result:
                         final_content = message.result
-                    if hasattr(message, "session_id") and message.session_id:
-                        session_id = message.session_id
-                        self._session_ids[key] = session_id
 
         except Exception as e:
             logger.exception("SDK query failed for session {}", key)
@@ -534,6 +676,10 @@ class SDKAgentLoop:
             content=final_content,
             metadata=meta,
         )
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
 
     async def process_direct(
         self,
@@ -561,5 +707,6 @@ class SDKAgentLoop:
         logger.info("SDK agent loop stopping")
 
     async def close_mcp(self) -> None:
-        """Cleanup (SDK manages its own MCP lifecycle)."""
-        pass
+        """Close all persistent SDK clients."""
+        for key in list(self._clients):
+            await self._close_client(key)
