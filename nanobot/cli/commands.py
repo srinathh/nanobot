@@ -524,7 +524,13 @@ def gateway(
         console.print("[cyan]Engine: Claude Agent SDK[/cyan]")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
-    provider = _make_provider(config)
+    if use_claude_agent:
+        try:
+            provider = _make_provider(config)
+        except (SystemExit, Exception):
+            provider = None
+    else:
+        provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -674,7 +680,7 @@ def gateway(
         on_execute=on_heartbeat_execute,
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
-        enabled=hb_cfg.enabled,
+        enabled=hb_cfg.enabled and provider is not None,
         timezone=config.agents.defaults.timezone,
     )
 

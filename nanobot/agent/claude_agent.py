@@ -55,6 +55,15 @@ class _NullToolRegistry:
         return None
 
 
+@dataclass
+class _NanobotMcpServer:
+    """Wraps the SDK MCP server config dict with nanobot context helpers."""
+
+    config: dict[str, Any]  # McpSdkServerConfig dict for the SDK
+    set_context: Callable[..., None] = lambda *a, **k: None
+    was_sent_in_turn: Callable[[], bool] = lambda: False
+
+
 # ---------------------------------------------------------------------------
 # In-process MCP server for nanobot-specific tools (message, cron)
 # ---------------------------------------------------------------------------
@@ -275,10 +284,11 @@ def _build_nanobot_mcp_server(
     def was_sent_in_turn() -> bool:
         return _msg_sent_in_turn
 
-    server._nanobot_set_context = set_context
-    server._nanobot_was_sent_in_turn = was_sent_in_turn
-
-    return server
+    return _NanobotMcpServer(
+        config=server,
+        set_context=set_context,
+        was_sent_in_turn=was_sent_in_turn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -286,11 +296,11 @@ def _build_nanobot_mcp_server(
 # ---------------------------------------------------------------------------
 
 def _build_mcp_servers_dict(
-    nanobot_server: Any,
+    nanobot_server: _NanobotMcpServer,
     config_mcp_servers: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Merge in-process nanobot MCP server with config-defined external MCP servers."""
-    servers: dict[str, Any] = {"nanobot": nanobot_server}
+    servers: dict[str, Any] = {"nanobot": nanobot_server.config}
     if not config_mcp_servers:
         return servers
 
@@ -639,7 +649,7 @@ class ClaudeAgentLoop:
         key = session_key or msg.session_key
 
         # Set tool context for message/cron routing
-        self._nanobot_server._nanobot_set_context(
+        self._nanobot_server.set_context(
             msg.channel, msg.chat_id, msg.metadata.get("message_id")
         )
 
@@ -673,7 +683,7 @@ class ClaudeAgentLoop:
         # If the message tool sent a reply, don't duplicate.
         # process_direct callers (cron callback) also check resp is None
         # to avoid duplicate delivery.
-        if self._nanobot_server._nanobot_was_sent_in_turn():
+        if self._nanobot_server.was_sent_in_turn():
             return None
 
         if not final_content:
