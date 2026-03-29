@@ -31,7 +31,6 @@ services:
   # Twilio + Claude agent engine
   nanobot-twilio-claude:
     <<: *common
-    command: ["gateway", "--verbose"]
     profiles:
       - twilio-claude
     build:

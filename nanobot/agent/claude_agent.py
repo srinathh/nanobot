@@ -410,32 +410,17 @@ class ClaudeAgentLoop:
             if name != "nanobot":
                 allowed_tools.append(f"mcp__{name}__*")
 
-        # Convert LiteLLM-style model name to Claude CLI model name.
-        # CLI accepts aliases ("sonnet", "opus") or short names ("claude-sonnet-4-6").
+        # Pass model name directly to CLI. Use CLI-native names in config
+        # (e.g. "sonnet", "opus", "claude-sonnet-4-6").
+        # Strip provider prefix if present (e.g. "anthropic/sonnet" -> "sonnet").
         model = defaults.model
         if "/" in model:
             model = model.split("/", 1)[1]
-        # Strip date suffixes (e.g. "claude-sonnet-4-20250514" -> "claude-sonnet-4")
-        # then map to CLI aliases
-        _CLI_MODEL_MAP = {
-            "claude-sonnet-4": "sonnet",
-            "claude-opus-4": "opus",
-            "claude-haiku-4": "haiku",
-            "claude-sonnet-4-5": "claude-sonnet-4-5",
-            "claude-opus-4-5": "claude-opus-4-5",
-            "claude-sonnet-4-6": "claude-sonnet-4-6",
-            "claude-opus-4-6": "claude-opus-4-6",
-            "claude-haiku-4-5": "claude-haiku-4-5",
-        }
-        # Try exact match first, then strip date suffix
-        if model not in _CLI_MODEL_MAP:
-            # "claude-sonnet-4-20250514" -> try "claude-sonnet-4"
-            parts = model.split("-")
-            for i in range(len(parts), 1, -1):
-                candidate = "-".join(parts[:i])
-                if candidate in _CLI_MODEL_MAP:
-                    model = _CLI_MODEL_MAP[candidate]
-                    break
+            logger.warning(
+                "Model '{}' contains a provider prefix — stripping to '{}'. "
+                "Use CLI-native model names in config for claude_agent engine.",
+                defaults.model, model,
+            )
 
         def _log_stderr(line: str) -> None:
             logger.debug("Claude CLI: {}", line.rstrip())
