@@ -410,14 +410,45 @@ class ClaudeAgentLoop:
             if name != "nanobot":
                 allowed_tools.append(f"mcp__{name}__*")
 
+        # Convert LiteLLM-style model name to Claude CLI model name.
+        # CLI accepts aliases ("sonnet", "opus") or short names ("claude-sonnet-4-6").
+        model = defaults.model
+        if "/" in model:
+            model = model.split("/", 1)[1]
+        # Strip date suffixes (e.g. "claude-sonnet-4-20250514" -> "claude-sonnet-4")
+        # then map to CLI aliases
+        _CLI_MODEL_MAP = {
+            "claude-sonnet-4": "sonnet",
+            "claude-opus-4": "opus",
+            "claude-haiku-4": "haiku",
+            "claude-sonnet-4-5": "claude-sonnet-4-5",
+            "claude-opus-4-5": "claude-opus-4-5",
+            "claude-sonnet-4-6": "claude-sonnet-4-6",
+            "claude-opus-4-6": "claude-opus-4-6",
+            "claude-haiku-4-5": "claude-haiku-4-5",
+        }
+        # Try exact match first, then strip date suffix
+        if model not in _CLI_MODEL_MAP:
+            # "claude-sonnet-4-20250514" -> try "claude-sonnet-4"
+            parts = model.split("-")
+            for i in range(len(parts), 1, -1):
+                candidate = "-".join(parts[:i])
+                if candidate in _CLI_MODEL_MAP:
+                    model = _CLI_MODEL_MAP[candidate]
+                    break
+
+        def _log_stderr(line: str) -> None:
+            logger.debug("Claude CLI: {}", line.rstrip())
+
         options_kwargs: dict[str, Any] = {
             "system_prompt": system_prompt,
-            "model": defaults.model,
+            "model": model,
             "max_turns": defaults.max_tool_iterations,
             "mcp_servers": self._mcp_servers,
             "allowed_tools": allowed_tools,
-            "permission_mode": "bypassPermissions",
+            "permission_mode": "acceptEdits",
             "cwd": str(self.workspace),
+            "stderr": _log_stderr,
         }
 
         return ClaudeAgentOptions(**options_kwargs)
