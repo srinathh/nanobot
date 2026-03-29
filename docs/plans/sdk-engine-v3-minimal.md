@@ -131,50 +131,208 @@ The Claude agent adapter. Major sections:
     *   `_handle_slash_command()`: engine-aware /new, /stop, /status, /help, /restart
     *   `_process_message()`: core SDK interaction via `ClaudeSDKClient`
 
-### Docker changes
+### Docker: Unified Dockerfile with build args
 
-#### `Dockerfile.sdk` (new) or extend existing Dockerfile
+Replace `Dockerfile`, `Dockerfile.twilio`, and any future engine-specific Dockerfiles with a single parameterized `Dockerfile`. Build args control which optional components are installed. A single `docker-compose.yml` uses profiles to select variants.
 
-The SDK spawns `claude` CLI as a subprocess, so the Docker image needs:
+#### Why
 
-1.  **Node.js** (for `claude` CLI) — already in the main `Dockerfile`
-2.  **Claude CLI**: `npm install -g @anthropic-ai/claude-code`
-3.  **Mount** `**~/.claude**`: contains OAuth tokens from `claude login`
+- One Dockerfile to maintain instead of 2-4
+- Upstream changes to the base image only need updating in one place
+- Adding a new feature (channel, engine) = adding a build arg, not a new file
+- Compose profiles are the standard Docker mechanism for service variants
 
+#### `Dockerfile` (replaces all existing Dockerfiles)
+
+```dockerfile
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+
+ARG INSTALL_NODE=false
+ARG INSTALL_CLAUDE_CLI=false
+ARG INSTALL_BRIDGE=false
+ARG EXTRAS=""
+
+# ── Base system deps (always) ──
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# ── Optional: Node.js (needed for WhatsApp bridge or Claude CLI) ──
+RUN if [ "$INSTALL_NODE" = "true" ]; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends curl gnupg git openssh-client && \
+      mkdir -p /etc/apt/keyrings && \
+      curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+        gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
+      echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list && \
+      apt-get update && apt-get install -y --no-install-recommends nodejs && \
+      apt-get purge -y gnupg && apt-get autoremove -y && \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# ── Optional: Claude CLI (requires Node.js) ──
+RUN if [ "$INSTALL_CLAUDE_CLI" = "true" ]; then \
+      npm install -g @anthropic-ai/claude-code; \
+    fi
+
+WORKDIR /app
+
+# ── Python deps (cached layer) ──
+COPY pyproject.toml README.md LICENSE ./
+RUN mkdir -p nanobot bridge && touch nanobot/__init__.py && \
+    if [ -n "$EXTRAS" ]; then \
+      uv pip install --system --no-cache ".[$EXTRAS]"; \
+    else \
+      uv pip install --system --no-cache .; \
+    fi && \
+    rm -rf nanobot bridge
+
+# ── App source ──
+COPY nanobot/ nanobot/
+
+# ── Optional: WhatsApp bridge ──
+COPY bridge/ bridge/
+RUN if [ "$INSTALL_BRIDGE" = "true" ]; then \
+      git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" && \
+      cd bridge && npm install && npm run build && cd ..; \
+    fi
+
+# ── Final install with source ──
+RUN if [ -n "$EXTRAS" ]; then \
+      uv pip install --system --no-cache ".[$EXTRAS]"; \
+    else \
+      uv pip install --system --no-cache .; \
+    fi
+
+RUN mkdir -p /root/.nanobot
+EXPOSE 18790
+ENTRYPOINT ["nanobot"]
+CMD ["gateway"]
 ```
-# Add to Dockerfile or create Dockerfile.sdk:
-RUN npm install -g @anthropic-ai/claude-code
+
+#### `docker-compose.yml` (replaces all compose files)
+
+```yaml
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    - ~/.nanobot:/root/.nanobot
+  command: ["gateway"]
+  restart: unless-stopped
+  ports:
+    - 18790:18790
+
+services:
+  # ── Twilio only, default engine (slim, no Node.js) ──
+  nanobot-twilio:
+    <<: *common
+    profiles: [twilio]
+    build:
+      context: .
+      args:
+        EXTRAS: twilio
+    deploy:
+      resources:
+        limits: { cpus: '1', memory: 512M }
+        reservations: { cpus: '0.25', memory: 128M }
+
+  # ── Twilio + Claude agent engine ──
+  nanobot-twilio-claude:
+    <<: *common
+    profiles: [twilio-claude]
+    build:
+      context: .
+      args:
+        EXTRAS: "twilio,sdk"
+        INSTALL_NODE: "true"
+        INSTALL_CLAUDE_CLI: "true"
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+      - ~/.claude:/root/.claude
+    deploy:
+      resources:
+        limits: { cpus: '2', memory: 1G }
+        reservations: { cpus: '0.5', memory: 256M }
+
+  # ── Full gateway (all channels + WhatsApp bridge) ──
+  nanobot-gateway:
+    <<: *common
+    profiles: [gateway]
+    build:
+      context: .
+      args:
+        INSTALL_NODE: "true"
+        INSTALL_BRIDGE: "true"
+    deploy:
+      resources:
+        limits: { cpus: '1', memory: 1G }
+        reservations: { cpus: '0.25', memory: 256M }
+
+  # ── Full gateway + Claude agent engine ──
+  nanobot-gateway-claude:
+    <<: *common
+    profiles: [gateway-claude]
+    build:
+      context: .
+      args:
+        INSTALL_NODE: "true"
+        INSTALL_BRIDGE: "true"
+        INSTALL_CLAUDE_CLI: "true"
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+      - ~/.claude:/root/.claude
+    deploy:
+      resources:
+        limits: { cpus: '2', memory: 1G }
+        reservations: { cpus: '0.5', memory: 256M }
+
+  # ── CLI (interactive, any profile) ──
+  nanobot-cli:
+    build:
+      context: .
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+    profiles: [cli]
+    command: ["status"]
+    stdin_open: true
+    tty: true
 ```
 
-#### `docker-compose.twilio.yml` / `docker-compose.yml`
+Usage:
 
-Add volume mount for Claude auth:
-
-```
-volumes:
-  - ~/.nanobot:/root/.nanobot
-  - ~/.claude:/root/.claude    # Claude CLI auth tokens
-```
-
-**Important**: The user must run `claude login` on the host first. The saved OAuth tokens in `~/.claude/` are what the CLI subprocess uses to authenticate against the Max plan.
-
-#### Alternative: API key auth
-
-If running without a logged-in CLI session, the SDK can use an API key via environment:
-
-```
-environment:
-  - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+```bash
+docker compose --profile twilio up -d           # what you run now
+docker compose --profile twilio-claude up -d     # add Claude agent engine
+docker compose --profile gateway up -d           # upstream-equivalent full build
+docker compose --profile gateway-claude up -d    # full + Claude agent engine
 ```
 
-This bypasses Max plan benefits but doesn't require mounting `~/.claude`.
+#### Auth
+
+The Claude agent engine requires Claude CLI auth. Two options:
+
+1. **Max plan (recommended)**: Run `claude login` on the host. Mount `~/.claude:/root/.claude` in compose (already configured in the `-claude` profiles above). The CLI subprocess inherits the OAuth tokens.
+
+2. **API key fallback**: Set `ANTHROPIC_API_KEY` as an environment variable in compose. Bypasses Max plan benefits but doesn't require `~/.claude` mount.
+
+#### Layer caching notes
+
+- Base + Python deps are shared across all variants (cached)
+- `INSTALL_NODE` layer is shared between bridge and Claude CLI variants
+- Switching between profiles (e.g. `twilio` to `twilio-claude`) rebuilds from the first divergent arg onwards
+- Rebuilds of the *same* profile reuse cache normally
 
 ## Migration from v2 branch
 
 1.  Start fresh from `main` (don't rebase `feature/sdk-engine-v2`)
-2.  Port `claude_agent.py` with the interface fixes (add `tools`, `sessions`)
-3.  Apply the minimal `commands.py` changes (constructor branch only)
-4.  Delete `readme-claude-agent.md` (was on v2 branch, not needed)
+2.  Replace `Dockerfile`, `Dockerfile.twilio`, `docker-compose.yml`, `docker-compose.twilio.yml` with unified versions
+3.  Port `claude_agent.py` with the interface fixes (add `tools`, `sessions`)
+4.  Apply the minimal `commands.py` and `schema.py` changes
+5.  Add `sdk` extra to `pyproject.toml`
+6.  Delete `readme-claude-agent.md` (was on v2 branch, not needed)
 
 ## Test plan
 
@@ -191,7 +349,7 @@ This bypasses Max plan benefits but doesn't require mounting `~/.claude`.
 ## Naming conventions
 
 | Old (v2) | New (v3) |
-|----------|----------|
+| --- | --- |
 | `engine: "legacy"` | `engine: "default"` |
 | `engine: "sdk"` | `engine: "claude_agent"` |
 | `SDKAgentLoop` | `ClaudeAgentLoop` |
