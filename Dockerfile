@@ -1,6 +1,7 @@
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 ARG INSTALL_NODE=false
+ARG INSTALL_CLAUDE_CLI=false
 ARG INSTALL_BRIDGE=false
 ARG EXTRAS=""
 
@@ -9,7 +10,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# ── Optional: Node.js 20 (needed for WhatsApp bridge) ──
+# ── Optional: Node.js 20 (needed for WhatsApp bridge or Claude CLI) ──
 RUN if [ "$INSTALL_NODE" = "true" ]; then \
       apt-get update && \
       apt-get install -y --no-install-recommends curl gnupg git openssh-client && \
@@ -22,6 +23,11 @@ RUN if [ "$INSTALL_NODE" = "true" ]; then \
       apt-get install -y --no-install-recommends nodejs && \
       apt-get purge -y gnupg && apt-get autoremove -y && \
       rm -rf /var/lib/apt/lists/*; \
+    fi
+
+# ── Optional: Claude CLI (requires Node.js) ──
+RUN if [ "$INSTALL_CLAUDE_CLI" = "true" ]; then \
+      npm install -g @anthropic-ai/claude-code; \
     fi
 
 WORKDIR /app

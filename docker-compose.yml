@@ -28,6 +28,29 @@ services:
           cpus: '0.25'
           memory: 128M
 
+  # Twilio + Claude agent engine
+  nanobot-twilio-claude:
+    <<: *common
+    profiles:
+      - twilio-claude
+    build:
+      context: .
+      args:
+        EXTRAS: "twilio,sdk"
+        INSTALL_NODE: "true"
+        INSTALL_CLAUDE_CLI: "true"
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+      - ~/.claude:/root/.claude
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
   # Full: all channels + WhatsApp bridge
   nanobot-gateway:
     <<: *common
@@ -45,6 +68,29 @@ services:
           memory: 1G
         reservations:
           cpus: '0.25'
+          memory: 256M
+
+  # Full + Claude agent engine
+  nanobot-gateway-claude:
+    <<: *common
+    profiles:
+      - gateway-claude
+    build:
+      context: .
+      args:
+        INSTALL_NODE: "true"
+        INSTALL_BRIDGE: "true"
+        INSTALL_CLAUDE_CLI: "true"
+    volumes:
+      - ~/.nanobot:/root/.nanobot
+      - ~/.claude:/root/.claude
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
           memory: 256M
 
   # CLI (interactive)

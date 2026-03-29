@@ -504,7 +504,6 @@ def gateway(
     config: str | None = typer.Option(None, "--config", "-c", help="Path to config file"),
 ):
     """Start the nanobot gateway."""
-    from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
     from nanobot.cron.service import CronService
@@ -518,8 +517,11 @@ def gateway(
 
     config = _load_runtime_config(config, workspace)
     port = port if port is not None else config.gateway.port
+    use_claude_agent = config.agents.defaults.engine == "claude_agent"
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
+    if use_claude_agent:
+        console.print("[cyan]Engine: Claude Agent SDK[/cyan]")
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
@@ -533,24 +535,37 @@ def gateway(
     cron_store_path = config.workspace_path / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
-    # Create agent with cron service
-    agent = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        session_manager=session_manager,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-    )
+    # Create agent
+    if use_claude_agent:
+        from nanobot.agent.claude_agent import ClaudeAgentLoop
+
+        agent = ClaudeAgentLoop(
+            bus=bus,
+            config=config,
+            cron_service=cron,
+            session_manager=session_manager,
+            channels_config=config.channels,
+        )
+    else:
+        from nanobot.agent.loop import AgentLoop
+
+        agent = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            web_search_config=config.tools.web.search,
+            web_proxy=config.tools.web.proxy or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            session_manager=session_manager,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            timezone=config.agents.defaults.timezone,
+        )
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
@@ -717,11 +732,11 @@ def agent(
     """Interact with the agent directly."""
     from loguru import logger
 
-    from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.cron.service import CronService
 
     config = _load_runtime_config(config, workspace)
+    use_claude_agent = config.agents.defaults.engine == "claude_agent"
     sync_workspace_templates(config.workspace_path)
 
     bus = MessageBus()
@@ -740,22 +755,34 @@ def agent(
     else:
         logger.disable("nanobot")
 
-    agent_loop = AgentLoop(
-        bus=bus,
-        provider=provider,
-        workspace=config.workspace_path,
-        model=config.agents.defaults.model,
-        max_iterations=config.agents.defaults.max_tool_iterations,
-        context_window_tokens=config.agents.defaults.context_window_tokens,
-        web_search_config=config.tools.web.search,
-        web_proxy=config.tools.web.proxy or None,
-        exec_config=config.tools.exec,
-        cron_service=cron,
-        restrict_to_workspace=config.tools.restrict_to_workspace,
-        mcp_servers=config.tools.mcp_servers,
-        channels_config=config.channels,
-        timezone=config.agents.defaults.timezone,
-    )
+    if use_claude_agent:
+        from nanobot.agent.claude_agent import ClaudeAgentLoop
+
+        agent_loop = ClaudeAgentLoop(
+            bus=bus,
+            config=config,
+            cron_service=cron,
+            channels_config=config.channels,
+        )
+    else:
+        from nanobot.agent.loop import AgentLoop
+
+        agent_loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=config.workspace_path,
+            model=config.agents.defaults.model,
+            max_iterations=config.agents.defaults.max_tool_iterations,
+            context_window_tokens=config.agents.defaults.context_window_tokens,
+            web_search_config=config.tools.web.search,
+            web_proxy=config.tools.web.proxy or None,
+            exec_config=config.tools.exec,
+            cron_service=cron,
+            restrict_to_workspace=config.tools.restrict_to_workspace,
+            mcp_servers=config.tools.mcp_servers,
+            channels_config=config.channels,
+            timezone=config.agents.defaults.timezone,
+        )
 
     # Shared reference for progress callbacks
     _thinking: ThinkingSpinner | None = None
