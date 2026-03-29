@@ -12,9 +12,11 @@ model, tools, sessions.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
@@ -390,6 +392,38 @@ class ClaudeAgentLoop:
             config.tools.mcp_servers if config.tools.mcp_servers else None,
         )
 
+        # Persistent mapping: nanobot session key → CLI session UUID
+        self._session_map_path = self.workspace / "claude_sessions.json"
+        self._session_map: dict[str, str] = self._load_session_map()
+
+    # ------------------------------------------------------------------
+    # Session map persistence (nanobot session key → CLI session UUID)
+    # ------------------------------------------------------------------
+
+    def _load_session_map(self) -> dict[str, str]:
+        """Load the session key → CLI session ID mapping from disk."""
+        if self._session_map_path.exists():
+            try:
+                return json.loads(self._session_map_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                logger.warning("Corrupt session map, starting fresh")
+        return {}
+
+    def _save_session_map(self) -> None:
+        """Persist the session map to disk."""
+        self._session_map_path.parent.mkdir(parents=True, exist_ok=True)
+        self._session_map_path.write_text(json.dumps(self._session_map))
+
+    def _record_session(self, session_key: str, cli_session_id: str) -> None:
+        """Record a nanobot→CLI session mapping and persist."""
+        self._session_map[session_key] = cli_session_id
+        self._save_session_map()
+
+    def _forget_session(self, session_key: str) -> None:
+        """Remove a session mapping (e.g. on /new)."""
+        self._session_map.pop(session_key, None)
+        self._save_session_map()
+
     # ------------------------------------------------------------------
     # Options builder
     # ------------------------------------------------------------------
@@ -443,23 +477,38 @@ class ClaudeAgentLoop:
     # ------------------------------------------------------------------
 
     async def _get_or_create_client(self, session_key: str) -> _SessionClient:
-        """Return an existing client for *session_key*, or create a new one."""
+        """Return an existing client for *session_key*, or create a new one.
+
+        If a CLI session UUID is persisted for this key, resume it.
+        """
         if session_key in self._clients:
             return self._clients[session_key]
 
         from claude_agent_sdk import ClaudeSDKClient
 
         options = self._build_options()
+
+        # Resume existing CLI session if we have a persisted mapping
+        cli_session_id = self._session_map.get(session_key)
+        if cli_session_id:
+            options.resume = cli_session_id
+            logger.info("Resuming CLI session {} for {}", cli_session_id, session_key)
+        else:
+            logger.info("Creating new CLI session for {}", session_key)
+
         client = ClaudeSDKClient(options=options)
         await client.__aenter__()
 
-        sc = _SessionClient(client=client)
+        sc = _SessionClient(client=client, session_id=cli_session_id)
         self._clients[session_key] = sc
-        logger.info("Created Claude agent client for session {}", session_key)
         return sc
 
-    async def _close_client(self, session_key: str) -> None:
-        """Close and remove the client for *session_key*."""
+    async def _close_client(self, session_key: str, *, forget: bool = False) -> None:
+        """Close and remove the client for *session_key*.
+
+        If forget=True, also remove the persisted CLI session mapping
+        so the next message starts a fresh conversation.
+        """
         sc = self._clients.pop(session_key, None)
         if sc and sc.client:
             try:
@@ -467,6 +516,8 @@ class ClaudeAgentLoop:
             except Exception:
                 logger.debug("Error closing Claude agent client for {}", session_key)
         self._session_locks.pop(session_key, None)
+        if forget:
+            self._forget_session(session_key)
 
     # ------------------------------------------------------------------
     # Slash command handling
@@ -477,7 +528,7 @@ class ClaudeAgentLoop:
         raw = msg.content.strip()
 
         if raw == "/new":
-            await self._close_client(msg.session_key)
+            await self._close_client(msg.session_key, forget=True)
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content="New session started.",
@@ -677,7 +728,10 @@ class ClaudeAgentLoop:
 
             async for message in sc.client.receive_response():
                 if isinstance(message, SystemMessage) and message.subtype == "init":
-                    sc.session_id = message.data.get("session_id")
+                    new_id = message.data.get("session_id")
+                    if new_id and new_id != sc.session_id:
+                        sc.session_id = new_id
+                        self._record_session(key, new_id)
 
                 elif isinstance(message, AssistantMessage):
                     if on_stream and hasattr(message, "content"):
